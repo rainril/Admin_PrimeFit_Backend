@@ -15,6 +15,7 @@ class AuthController extends Controller
 {
     public function register(Request $request)
     {
+        abort_unless($request->user()?->admin?->admin_level === 'owner', 403);
         $request->validate([
             'firstName' => 'required|string|max:255',
             'lastName' => 'required|string|max:255',

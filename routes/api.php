@@ -15,6 +15,7 @@ use App\Http\Controllers\Api\EquipmentItemController;
 use App\Http\Controllers\Api\DeletionRequestController;
 use App\Http\Controllers\Api\ApprovalController;
 use App\Http\Controllers\Api\SettingsController;
+use App\Http\Controllers\Api\PendingRegistrationController;
 use App\Http\Controllers\PaymentController as BillingController;
 
 Route::get('/settings/{accountId}', [SettingsController::class, 'show']);
@@ -73,7 +74,7 @@ Route::post('/payments/webhook', [BillingController::class, 'webhook']);
 Route::get('/payments/{paymentId}/status', [BillingController::class, 'status']);
 Route::get('/customers/{customerId}/billing-history', [BillingController::class, 'history']);
 Route::post('/sync-membership', [SyncController::class, 'syncMembership']);
-Route::post('/register', [AuthController::class, 'register']);
+Route::middleware('auth:sanctum')->post('/register', [AuthController::class, 'register']);
 Route::post('/login', [AuthController::class, 'login']);
 Route::post('/forgot-password', [AuthController::class, 'forgotPassword']);
 Route::post('/reset-password', [AuthController::class, 'resetPassword']);
@@ -82,6 +83,16 @@ Route::post('/send-earnings-email', [PaymentController::class, 'sendEarningsEmai
 
 Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
     return $request->user();
+});
+
+Route::middleware('auth:sanctum')->group(function () {
+    Route::get('/pending-registrations', [PendingRegistrationController::class, 'index']);
+    Route::get('/reviewed-payments', [PendingRegistrationController::class, 'approvedPayments']);
+    Route::get('/pending-registrations/{id}/receipt', [PendingRegistrationController::class, 'receipt']);
+    Route::post('/pending-registrations/{id}/approve', [PendingRegistrationController::class, 'approve']);
+    Route::post('/pending-registrations/{id}/reject', [PendingRegistrationController::class, 'reject']);
+    Route::get('/pending-payments/{id}/receipt', [PendingRegistrationController::class, 'legacyReceipt']);
+    Route::post('/pending-payments/{id}/{decision}', [PendingRegistrationController::class, 'reviewLegacy']);
 });
 
 Route::get('/customers', [CustomerController::class, 'index']);

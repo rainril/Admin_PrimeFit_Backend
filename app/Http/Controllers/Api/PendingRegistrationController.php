@@ -1,0 +1,229 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+
+class PendingRegistrationController extends Controller
+{
+    private function requireAdmin(Request $request): void
+    {
+        abort_unless($request->user() && $request->user()->role === 'admin'
+            && $request->user()->admin()->exists(), 403);
+    }
+
+    public function index(Request $request)
+    {
+        $this->requireAdmin($request);
+        $rows = DB::connection('memberaccount')->table('PendingRegistrations as r')
+            ->join('Plans as p', 'p.PlanID', '=', 'r.PlanID')
+            ->where('r.Status', 'Pending')
+            ->orderByDesc('r.RegistrationID')
+            ->get(['r.RegistrationID', 'r.FirstName', 'r.LastName', 'r.Email',
+                'r.Amount', 'r.PaymentMethod', 'r.CreatedAt', 'p.DurationLabel']);
+        $pending = $rows->map(fn ($r) => [
+            'payment_id' => 'R-'.$r->RegistrationID,
+            'member_name' => trim($r->FirstName.' '.$r->LastName),
+            'member_email' => $r->Email,
+            'plan' => $r->DurationLabel,
+            'plan_price' => $r->Amount,
+            'method' => $r->PaymentMethod,
+            'date' => $r->CreatedAt,
+            'purpose' => 'New Registration',
+        ]);
+        // Legacy signups already stored a Member and linked pending Payment.
+        // Include those receipts so they can be reviewed without changing data.
+        $legacy = DB::connection('memberaccount')->table('Payments as py')
+            ->join('Members as m', 'm.MemberID', '=', 'py.MemberID')
+            ->leftJoin('Memberships as ms', 'ms.MembershipID', '=', 'py.MembershipID')
+            ->leftJoin('Plans as p', 'p.PlanID', '=', 'ms.PlanID')
+            ->where('py.Status', 'Pending')->whereNotNull('py.ReceiptURL')
+            ->get(['py.PaymentID', 'py.Amount', 'py.Method', 'py.Date', 'm.FirstName',
+                'm.LastName', 'm.Email', 'p.DurationLabel']);
+        $pending = $pending->concat($legacy->map(function ($r) {
+            $plan = $r->DurationLabel;
+            if (!$plan) {
+                $matches = DB::connection('memberaccount')->table('Plans')->where('Price', $r->Amount)->limit(2)->get(['DurationLabel']);
+                if ($matches->count() === 1) $plan = $matches->first()->DurationLabel;
+            }
+            return [
+                'payment_id' => 'P-'.$r->PaymentID,
+                'member_name' => trim($r->FirstName.' '.$r->LastName),
+                'member_email' => $r->Email, 'plan' => $plan,
+                'plan_price' => $r->Amount, 'method' => $r->Method,
+                'date' => $r->Date, 'purpose' => 'Payment review',
+            ];
+        }));
+        return response()->json(['success' => true, 'pending' => $pending->values()]);
+    }
+
+    public function receipt(Request $request, int $id)
+    {
+        $this->requireAdmin($request);
+        $row = DB::connection('memberaccount')->table('PendingRegistrations')
+            ->where('RegistrationID', $id)->first(['Receipt', 'ReceiptMime']);
+        abort_unless($row, 404);
+        return response($row->Receipt, 200, [
+            'Content-Type' => $row->ReceiptMime,
+            'Cache-Control' => 'private, no-store',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
+    }
+
+    public function approvedPayments(Request $request)
+    {
+        $this->requireAdmin($request);
+        $rows = DB::connection('memberaccount')->table('Payments as py')
+            ->join('Members as m', 'm.MemberID', '=', 'py.MemberID')
+            ->leftJoin('Memberships as ms', 'ms.MembershipID', '=', 'py.MembershipID')
+            ->leftJoin('Plans as p', 'p.PlanID', '=', 'ms.PlanID')
+            ->where('py.Status', 'Paid')->orderByDesc('py.PaymentID')
+            ->get(['py.Amount', 'py.Method', 'py.Date', 'm.FirstName', 'm.LastName', 'p.DurationLabel']);
+        return response()->json(['success' => true, 'payments' => $rows->map(fn ($r) => [
+            'member' => trim($r->FirstName.' '.$r->LastName), 'plan' => $r->DurationLabel,
+            'amount' => $r->Amount, 'method' => $r->Method, 'date' => $r->Date, 'status' => 'Paid',
+        ])]);
+    }
+
+    public function approve(Request $request, int $id)
+    {
+        $this->requireAdmin($request);
+        $secret = env('QR_SECRET_KEY');
+        abort_unless(is_string($secret) && $secret !== '', 503, 'QR signing is not configured.');
+        $db = DB::connection('memberaccount');
+        $memberId = $db->transaction(function () use ($db, $id, $secret) {
+            $r = $db->table('PendingRegistrations')->where('RegistrationID', $id)->lockForUpdate()->first();
+            abort_unless($r, 404);
+            abort_unless($r->Status === 'Pending', 409, 'This registration has already been reviewed.');
+            abort_if($db->table('Members')->where('Email', $r->Email)->exists(), 409, 'An account with this email already exists. Review it manually.');
+            $plan = $db->table('Plans')->where('PlanID', $r->PlanID)->first();
+            abort_unless($plan && (int) $plan->DurationMonths > 0, 422, 'The selected plan is unavailable.');
+            $memberId = $db->table('Members')->insertGetId([
+                'FirstName' => $r->FirstName, 'LastName' => $r->LastName,
+                'Email' => $r->Email, 'PasswordHash' => $r->PasswordHash,
+                'Phone' => $r->Phone, 'DateOfBirth' => $r->DateOfBirth,
+                'Gender' => $r->Gender, 'Address' => $r->Address,
+            ]);
+            $payload = $memberId.'.'.time();
+            $db->table('Members')->where('MemberID', $memberId)->update([
+                'QRCodeData' => $payload.'.'.hash_hmac('sha256', $payload, $secret),
+            ]);
+            $months = (int) $plan->DurationMonths;
+            $membershipId = $db->table('Memberships')->insertGetId([
+                'MemberID' => $memberId, 'PlanID' => $r->PlanID,
+                'StartDate' => now()->toDateString(),
+                'NextRenewalDate' => now()->addMonthsNoOverflow($months)->toDateString(),
+                'Status' => 'Active', 'SessionCredits' => $months * 30, 'SessionsUsed' => 0,
+            ]);
+            $db->table('Payments')->insert([
+                'MemberID' => $memberId, 'MembershipID' => $membershipId,
+                'Date' => now()->toDateString(), 'Amount' => $r->Amount,
+                'Method' => $r->PaymentMethod, 'Status' => 'Paid',
+            ]);
+            $db->table('PendingRegistrations')->where('RegistrationID', $id)->update([
+                'Status' => 'Approved', 'ReviewedAt' => now(), 'MemberID' => $memberId,
+                'PasswordHash' => '',
+            ]);
+            return $memberId;
+        });
+        return response()->json(['success' => true, 'member_id' => $memberId, 'message' => 'Registration approved.']);
+    }
+
+    public function reject(Request $request, int $id)
+    {
+        $this->requireAdmin($request);
+        $updated = DB::connection('memberaccount')->table('PendingRegistrations')
+            ->where('RegistrationID', $id)->where('Status', 'Pending')
+            ->update(['Status' => 'Rejected', 'ReviewedAt' => now(), 'PasswordHash' => '']);
+        if (!$updated) return response()->json(['success' => false, 'message' => 'Registration not found or already reviewed.'], 409);
+        return response()->json(['success' => true, 'message' => 'Registration rejected.']);
+    }
+
+    public function legacyReceipt(Request $request, int $id)
+    {
+        $this->requireAdmin($request);
+        $row = DB::connection('memberaccount')->table('Payments')
+            ->where('PaymentID', $id)->first(['ReceiptURL']);
+        $path = $row->ReceiptURL ?? '';
+        abort_unless(preg_match('#^uploads/receipts/[A-Za-z0-9_.-]+$#D', $path), 404);
+        $response = Http::timeout(10)->get('https://member-account-backend.onrender.com/'.$path);
+        $contentType = (string) $response->header('Content-Type');
+        abort_unless($response->successful() && str_starts_with($contentType, 'image/'), 404);
+        return response($response->body(), 200, [
+            'Content-Type' => $contentType,
+            'Cache-Control' => 'private, no-store',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
+    }
+
+    public function reviewLegacy(Request $request, int $id, string $decision)
+    {
+        $this->requireAdmin($request);
+        abort_unless(in_array($decision, ['approve', 'reject'], true), 404);
+        // Do not approve an older registration when its receipt can no
+        // longer be retrieved for review (for example after a redeploy).
+        if ($decision === 'approve') $this->legacyReceipt($request, $id);
+        $db = DB::connection('memberaccount');
+        $db->transaction(function () use ($db, $id, $decision) {
+            $payment = $db->table('Payments')->where('PaymentID', $id)->lockForUpdate()->first();
+            abort_unless($payment && $payment->ReceiptURL, 404);
+            abort_unless($payment->Status === 'Pending', 409, 'This payment has already been reviewed.');
+            if (!$payment->MembershipID) {
+                if ($decision === 'reject') {
+                    $db->table('Payments')->where('PaymentID', $id)->update(['Status' => 'Failed']);
+                    return;
+                }
+                $plans = $db->table('Plans')->where('Price', $payment->Amount)->limit(2)->get();
+                abort_unless($plans->count() === 1 && (int) $plans->first()->DurationMonths > 0, 422, 'Cannot identify a unique plan for this payment. Review it manually.');
+                $plan = $plans->first();
+                $months = (int) $plan->DurationMonths;
+                $membership = $db->table('Memberships')->where('MemberID', $payment->MemberID)
+                    ->where('Status', 'Active')->orderByDesc('MembershipID')->lockForUpdate()->first();
+                if ($membership && (int) $membership->PlanID === (int) $plan->PlanID) {
+                    $renewal = $membership->NextRenewalDate ? \Carbon\Carbon::parse($membership->NextRenewalDate) : now();
+                    if ($renewal->isPast()) $renewal = now();
+                    $db->table('Memberships')->where('MembershipID', $membership->MembershipID)
+                        ->update([
+                            'NextRenewalDate' => $renewal->addMonthsNoOverflow($months)->toDateString(),
+                            'SessionCredits' => (int) $membership->SessionCredits + $months * 30,
+                        ]);
+                    $membershipId = $membership->MembershipID;
+                } else {
+                    if ($membership) {
+                        $db->table('Memberships')->where('MemberID', $payment->MemberID)
+                            ->where('Status', 'Active')->update(['Status' => 'Expired']);
+                    }
+                    $membershipId = $db->table('Memberships')->insertGetId([
+                        'MemberID' => $payment->MemberID, 'PlanID' => $plan->PlanID,
+                        'StartDate' => now()->toDateString(), 'NextRenewalDate' => now()->addMonthsNoOverflow($months)->toDateString(),
+                        'Status' => 'Active', 'SessionCredits' => $months * 30, 'SessionsUsed' => 0,
+                    ]);
+                }
+                $db->table('Payments')->where('PaymentID', $id)->update(['Status' => 'Paid', 'MembershipID' => $membershipId]);
+                return;
+            }
+            $membership = $db->table('Memberships')->where('MembershipID', $payment->MembershipID)->lockForUpdate()->first();
+            abort_unless($membership && (int) $membership->MemberID === (int) $payment->MemberID, 409);
+            $paid = $db->table('Payments')->where('MembershipID', $membership->MembershipID)->where('Status', 'Paid')->exists();
+            if ($decision === 'reject') {
+                if (!$paid) $db->table('Memberships')->where('MembershipID', $membership->MembershipID)->update(['Status' => 'Cancelled']);
+            } else {
+                if (!$paid) {
+                    $plan = $db->table('Plans')->where('PlanID', $membership->PlanID)->first();
+                    abort_unless($plan && (int) $plan->DurationMonths > 0, 422, 'The selected plan is unavailable.');
+                    $months = (int) $plan->DurationMonths;
+                    $db->table('Memberships')->where('MembershipID', $membership->MembershipID)->update([
+                        'Status' => 'Active', 'StartDate' => now()->toDateString(),
+                        'NextRenewalDate' => now()->addMonthsNoOverflow($months)->toDateString(),
+                        'SessionCredits' => $months * 30, 'SessionsUsed' => 0,
+                    ]);
+                }
+            }
+            $db->table('Payments')->where('PaymentID', $id)->update(['Status' => $decision === 'approve' ? 'Paid' : 'Failed']);
+        });
+        return response()->json(['success' => true, 'message' => 'Payment reviewed.']);
+    }
+}

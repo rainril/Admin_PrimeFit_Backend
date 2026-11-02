@@ -6,6 +6,12 @@ use Illuminate\Support\Facades\DB;
 
 class MemberAccountService
 {
+    private static function initialPaymentUnapproved(int $membershipId): bool
+    {
+        $payments = DB::connection('memberaccount')->table('Payments')->where('MembershipID', $membershipId);
+        return (clone $payments)->whereIn('Status', ['Pending', 'Failed'])->exists()
+            && !(clone $payments)->where('Status', 'Paid')->exists();
+    }
     /**
      * Kunin ang detalye ng member (kasama ang aktibong membership plan)
      * mula sa memberaccount_db, gamit ang MemberID.
@@ -32,7 +38,9 @@ class MemberAccountService
         $expiryDate = null;
         $status = 'expired';
 
-        if ($membership) {
+        if ($membership && self::initialPaymentUnapproved((int) $membership->MembershipID)) {
+            $status = 'pending';
+        } elseif ($membership) {
             $plan = DB::connection('memberaccount')
                 ->table('Plans')
                 ->where('PlanID', $membership->PlanID)
@@ -83,7 +91,9 @@ class MemberAccountService
             $plan = $membership ? ($plans->get($membership->PlanID)) : null;
 
             $status = 'expired';
-            if ($membership) {
+            if ($membership && self::initialPaymentUnapproved((int) $membership->MembershipID)) {
+                $status = 'pending';
+            } elseif ($membership) {
                 $status = 'active';
                 if ($membership->NextRenewalDate && now()->greaterThan($membership->NextRenewalDate)) {
                     $status = 'expired';
@@ -125,6 +135,10 @@ class MemberAccountService
 
         if (!$membership) {
             return ['success' => false, 'message' => 'No active membership found for this member.'];
+        }
+
+        if (self::initialPaymentUnapproved((int) $membership->MembershipID)) {
+            return ['success' => false, 'message' => 'Payment is awaiting admin approval.'];
         }
 
         $sessionCredits = (int) $membership->SessionCredits;
