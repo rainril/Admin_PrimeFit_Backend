@@ -13,7 +13,7 @@ class MemberAccountService
     public static function getMemberDetails(int $memberId): ?array
     {
         $member = DB::connection('memberaccount')
-            ->table('members')
+            ->table('Members')
             ->where('MemberID', $memberId)
             ->first();
 
@@ -22,7 +22,7 @@ class MemberAccountService
         }
 
         $membership = DB::connection('memberaccount')
-            ->table('memberships')
+            ->table('Memberships')
             ->where('MemberID', $memberId)
             ->where('Status', 'Active')
             ->orderByDesc('StartDate')
@@ -34,7 +34,7 @@ class MemberAccountService
 
         if ($membership) {
             $plan = DB::connection('memberaccount')
-                ->table('plans')
+                ->table('Plans')
                 ->where('PlanID', $membership->PlanID)
                 ->first();
 
@@ -67,16 +67,16 @@ class MemberAccountService
      */
     public static function getAllMembersLive(): array
     {
-        $members = DB::connection('memberaccount')->table('members')->get();
+        $members = DB::connection('memberaccount')->table('Members')->get();
 
         $memberships = DB::connection('memberaccount')
-            ->table('memberships')
+            ->table('Memberships')
             ->where('Status', 'Active')
             ->orderByDesc('StartDate')
             ->get()
             ->groupBy('MemberID');
 
-        $plans = DB::connection('memberaccount')->table('plans')->get()->keyBy('PlanID');
+        $plans = DB::connection('memberaccount')->table('Plans')->get()->keyBy('PlanID');
 
         return $members->map(function ($member) use ($memberships, $plans) {
             $membership = optional($memberships->get($member->MemberID))->first();
@@ -116,7 +116,7 @@ class MemberAccountService
     {
         $connection = DB::connection('memberaccount');
 
-        $membership = $connection->table('memberships')
+        $membership = $connection->table('Memberships')
             ->where('MemberID', $memberId)
             ->where('Status', 'Active')
             ->orderByDesc('StartDate')
@@ -143,7 +143,7 @@ class MemberAccountService
                 'SessionCreditUsed'  => 1,
             ]);
 
-            $connection->table('memberships')
+            $connection->table('Memberships')
                 ->where('MembershipID', $membership->MembershipID)
                 ->update(['SessionsUsed' => $sessionsUsed + 1]);
 
