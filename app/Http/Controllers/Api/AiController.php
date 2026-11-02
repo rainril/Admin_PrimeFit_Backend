@@ -469,11 +469,28 @@ class AiController extends Controller
     }
 
     // ================= ATTENDANCE ANALYTICS =================
-    // Real weekly foot-traffic: member check-ins (attendance_logs) + walk-ins,
-    // grouped by day for the current Mon-Sun business week. This replaces the
-    // hardcoded dummy values that used to sit in the Flutter dashboard.
+    // Real foot-traffic: member check-ins (attendance_logs) + walk-ins.
+    // period=weekly (default, unchanged) groups by day for the current
+    // Mon-Sun business week -- existing callers that don't pass `period`
+    // keep exactly the same response shape as before. period=monthly
+    // groups by calendar month for the last 6 months (mirrors
+    // revenueAnalytics' weekly/monthly/yearly pattern above), powering
+    // the Dashboard's new "Monthly Attendance" card.
 
-    public function attendanceAnalytics()
+    public function attendanceAnalytics(Request $request)
+    {
+        $period = $request->query('period', 'weekly'); // weekly | monthly
+
+        $data = $period === 'monthly' ? $this->attendanceMonthly() : $this->attendanceWeekly();
+
+        return response()->json([
+            'success' => true,
+            'labels' => $data['labels'],
+            'values' => $data['values'],
+        ]);
+    }
+
+    private function attendanceWeekly(): array
     {
         $start = now()->startOfWeek(Carbon::MONDAY);
         $labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -491,11 +508,30 @@ class AiController extends Controller
             $values[] = $memberCheckIns + $walkIns;
         }
 
-        return response()->json([
-            'success' => true,
-            'labels' => $labels,
-            'values' => $values,
-        ]);
+        return ['labels' => $labels, 'values' => $values];
+    }
+
+    private function attendanceMonthly(): array
+    {
+        $labels = [];
+        $values = [];
+
+        for ($i = 5; $i >= 0; $i--) {
+            $month = now()->copy()->subMonths($i);
+            $start = $month->copy()->startOfMonth();
+            $end = $month->copy()->endOfMonth();
+
+            $memberCheckIns = AttendanceLog::whereBetween('date', [$start->toDateString(), $end->toDateString()])
+                ->distinct('customer_id')
+                ->count('customer_id');
+
+            $walkIns = WalkIn::whereBetween('date', [$start->toDateString(), $end->toDateString()])->count();
+
+            $labels[] = $month->format('M');
+            $values[] = $memberCheckIns + $walkIns;
+        }
+
+        return ['labels' => $labels, 'values' => $values];
     }
 
     // ================= RECENT NOTIFICATIONS =================

@@ -120,6 +120,7 @@ class MemberAccountService
             ->where('MemberID', $memberId)
             ->where('Status', 'Active')
             ->orderByDesc('StartDate')
+            ->orderByDesc('MembershipID')
             ->first();
 
         if (!$membership) {

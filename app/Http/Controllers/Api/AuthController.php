@@ -103,7 +103,11 @@ class AuthController extends Controller
         $account->reset_code_expires_at = now()->addMinutes(15);
         $account->save();
 
-        Mail::to($account->email)->send(new PasswordResetCode((string) $code));
+        try {
+            Mail::to($account->email)->send(new PasswordResetCode((string) $code));
+        } catch (\Exception $e) {
+            \Log::error('Failed to send password reset email: ' . $e->getMessage());
+        }
 
         return response()->json([
             'message' => 'If that email exists, a reset code has been sent.',
