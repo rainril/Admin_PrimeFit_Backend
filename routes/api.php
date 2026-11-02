@@ -82,7 +82,22 @@ Route::post('/verify-reset-code', [AuthController::class, 'verifyResetCode']);
 Route::post('/send-earnings-email', [PaymentController::class, 'sendEarningsEmail']);
 
 Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
-    return $request->user();
+    $account = $request->user();
+    $admin = $account->admin;
+    abort_unless($admin, 403, 'This account is not registered as staff or admin.');
+
+    return response()->json([
+        'accountId' => $account->id,
+        'email' => $account->email,
+        'firstName' => $admin->first_name,
+        'lastName' => $admin->last_name,
+        'adminLevel' => $admin->admin_level,
+    ]);
+});
+
+Route::middleware('auth:sanctum')->post('/logout', function (Request $request) {
+    $request->user()->currentAccessToken()?->delete();
+    return response()->json(['success' => true]);
 });
 
 Route::middleware('auth:sanctum')->group(function () {
