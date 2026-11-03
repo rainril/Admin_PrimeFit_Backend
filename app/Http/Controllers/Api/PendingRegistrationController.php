@@ -42,7 +42,7 @@ class PendingRegistrationController extends Controller
             ->leftJoin('Plans as p', 'p.PlanID', '=', 'ms.PlanID')
             ->where('py.Status', 'Pending')->whereNotNull('py.ReceiptURL')
             ->get(['py.PaymentID', 'py.Amount', 'py.Method', 'py.Date', 'm.FirstName',
-                'm.LastName', 'm.Email', 'p.DurationLabel']);
+                'm.LastName', 'm.Email', 'p.DurationLabel', 'py.Purpose']);
         $pending = $pending->concat($legacy->map(function ($r) {
             $plan = $r->DurationLabel;
             if (!$plan) {
@@ -54,7 +54,9 @@ class PendingRegistrationController extends Controller
                 'member_name' => trim($r->FirstName.' '.$r->LastName),
                 'member_email' => $r->Email, 'plan' => $plan,
                 'plan_price' => $r->Amount, 'method' => $r->Method,
-                'date' => $r->Date, 'purpose' => 'Payment review',
+                'date' => $r->Date,
+                'purpose' => in_array($r->Purpose, ['New Registration', 'Renewal', 'Upgrade'], true)
+                    ? $r->Purpose : 'Payment review',
             ];
         }));
         return response()->json(['success' => true, 'pending' => $pending->values()]);
@@ -192,6 +194,9 @@ class PendingRegistrationController extends Controller
                         ]);
                     $membershipId = $membership->MembershipID;
                 } else {
+                    $remainingCredits = $membership
+                        ? max(0, (int) $membership->SessionCredits - (int) $membership->SessionsUsed)
+                        : 0;
                     if ($membership) {
                         $db->table('Memberships')->where('MemberID', $payment->MemberID)
                             ->where('Status', 'Active')->update(['Status' => 'Expired']);
@@ -199,7 +204,7 @@ class PendingRegistrationController extends Controller
                     $membershipId = $db->table('Memberships')->insertGetId([
                         'MemberID' => $payment->MemberID, 'PlanID' => $plan->PlanID,
                         'StartDate' => now()->toDateString(), 'NextRenewalDate' => now()->addMonthsNoOverflow($months)->toDateString(),
-                        'Status' => 'Active', 'SessionCredits' => $months * 30, 'SessionsUsed' => 0,
+                        'Status' => 'Active', 'SessionCredits' => $remainingCredits + ($months * 30), 'SessionsUsed' => 0,
                     ]);
                 }
                 $db->table('Payments')->where('PaymentID', $id)->update(['Status' => 'Paid', 'MembershipID' => $membershipId]);
