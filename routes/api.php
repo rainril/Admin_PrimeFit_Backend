@@ -55,6 +55,7 @@ Route::get('/dashboard/notifications', [AiController::class, 'recentNotification
 
 Route::get('/walk-ins', [WalkInController::class, 'index']);
 Route::post('/walk-ins', [WalkInController::class, 'store']);
+Route::post('/walk-ins/{id}/check-out', [WalkInController::class, 'checkOut']);
 Route::put('/walk-ins/{id}', [WalkInController::class, 'update']);
 Route::delete('/walk-ins/{id}', [WalkInController::class, 'destroy']);
 
@@ -118,6 +119,7 @@ Route::get('/live-members', [CustomerController::class, 'liveMembers']);
 
 Route::get('/attendance', [AttendanceController::class, 'index']);
 Route::post('/attendance', [AttendanceController::class, 'store']);
+Route::post('/attendance/{id}/check-out', [AttendanceController::class, 'checkOut']);
 
 Route::get('/ai/dashboard-summary', [AiController::class, 'dashboardSummary']);
 Route::get('/dashboard-stats', [AiController::class, 'dashboardStats']);

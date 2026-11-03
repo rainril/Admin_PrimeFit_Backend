@@ -63,6 +63,33 @@ class WalkInController extends Controller
         ], 201);
     }
 
+    // POST /api/walk-ins/{id}/check-out - record a walk-in's check-out once.
+    public function checkOut($id)
+    {
+        $walkIn = WalkIn::whereKey($id)
+            ->whereDate('date', now()->toDateString())
+            ->first();
+
+        if (!$walkIn) {
+            return response()->json(['message' => 'Today\'s walk-in record was not found.'], 404);
+        }
+        if (!$walkIn->check_in) {
+            return response()->json(['message' => 'This walk-in has no check-in time.'], 409);
+        }
+        if ($walkIn->check_out && !in_array(trim($walkIn->check_out), ['--', 'No check-out'], true)) {
+            return response()->json(['message' => 'This walk-in is already checked out.'], 409);
+        }
+
+        $walkIn->check_out = now()->format('g:i A');
+        $walkIn->save();
+
+        return response()->json([
+            'message' => 'Walk-in checked out successfully.',
+            'id' => (string) $walkIn->id,
+            'checkOut' => $walkIn->check_out,
+        ]);
+    }
+
     // PUT /api/walk-ins/{id} - i-update ang walk-in record
     public function update(Request $request, $id)
     {

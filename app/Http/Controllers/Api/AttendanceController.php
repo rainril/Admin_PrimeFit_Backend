@@ -31,6 +31,33 @@ class AttendanceController extends Controller
         return response()->json($result);
     }
 
+    // POST /api/attendance/{id}/check-out - record a member's check-out once.
+    public function checkOut($id)
+    {
+        $log = AttendanceLog::whereKey($id)
+            ->whereDate('date', now()->toDateString())
+            ->first();
+
+        if (!$log) {
+            return response()->json(['message' => 'Today\'s attendance record was not found.'], 404);
+        }
+        if (!$log->check_in_time || $log->status === 'Absent') {
+            return response()->json(['message' => 'This record has no valid check-in.'], 409);
+        }
+        if ($log->check_out_time) {
+            return response()->json(['message' => 'This attendance record is already checked out.'], 409);
+        }
+
+        $log->check_out_time = now()->format('H:i:s');
+        $log->save();
+
+        return response()->json([
+            'message' => 'Member checked out successfully.',
+            'id' => (string) $log->id,
+            'checkOut' => $this->formatTime($log->check_out_time),
+        ]);
+    }
+
     // Converts a raw "HH:MM:SS" time column into a friendly 12-hour
     // "h:mm AM/PM" string, matching how Walk-in times are displayed.
     // Returns '--' for null/empty values (e.g. no check-out yet).
