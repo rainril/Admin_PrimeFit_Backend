@@ -198,7 +198,16 @@ class PendingRegistrationController extends Controller
             $payment = $db->table('Payments')->where('PaymentID', $id)->lockForUpdate()->first();
             abort_unless($payment && $payment->ReceiptURL, 404);
             abort_unless($payment->Status === 'Pending', 409, 'This payment has already been reviewed.');
-            if (!$payment->MembershipID) {
+            $linkedMembership = $payment->MembershipID
+                ? $db->table('Memberships')->where('MembershipID', $payment->MembershipID)
+                    ->where('MemberID', $payment->MemberID)->lockForUpdate()->first()
+                : null;
+            abort_if($payment->MembershipID && !$linkedMembership, 409, 'The linked membership was not found.');
+            // New upgrade receipts link to the current active membership to
+            // support databases where Payments.MembershipID is NOT NULL.
+            // Treat those like unlinked manual payments so plan changes still
+            // happen only inside this admin approval transaction.
+            if (!$linkedMembership || $linkedMembership->Status === 'Active') {
                 if ($decision === 'reject') {
                     $db->table('Payments')->where('PaymentID', $id)->update(['Status' => 'Failed']);
                     return;
@@ -235,8 +244,7 @@ class PendingRegistrationController extends Controller
                 $db->table('Payments')->where('PaymentID', $id)->update(['Status' => 'Paid', 'MembershipID' => $membershipId]);
                 return;
             }
-            $membership = $db->table('Memberships')->where('MembershipID', $payment->MembershipID)->lockForUpdate()->first();
-            abort_unless($membership && (int) $membership->MemberID === (int) $payment->MemberID, 409);
+            $membership = $linkedMembership;
             $paid = $db->table('Payments')->where('MembershipID', $membership->MembershipID)->where('Status', 'Paid')->exists();
             if ($decision === 'reject') {
                 if (!$paid) $db->table('Memberships')->where('MembershipID', $membership->MembershipID)->update(['Status' => 'Cancelled']);
