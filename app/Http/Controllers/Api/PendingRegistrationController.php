@@ -17,20 +17,29 @@ class PendingRegistrationController extends Controller
             && $request->user()->admin()->exists(), 403);
     }
 
-    private function sendRejectionNotice(string $email, string $name, ?string $plan, string $reason): bool
+    private function sendPaymentDecisionNotice(
+        string $email,
+        string $name,
+        ?string $plan,
+        string $decision,
+        string $reason = '',
+    ): bool
     {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return false;
         $resendKey = config('services.resend.key');
         $resendFrom = config('services.resend.from_address');
-        $reason = trim($reason) ?: 'We could not verify the payment receipt or submitted information.';
         $planLine = $plan ? "Plan: {$plan}\n" : '';
-        $body = "Hello {$name},\n\n"
-            . "Your PrimeFit membership payment request was reviewed but could not be approved.\n"
-            . $planLine
-            . "Reason: {$reason}\n\n"
-            . "Please review the reason and contact the gym or submit corrected payment information. "
-            . "Your membership and session credits were not changed by this rejection.\n\n"
-            . "PrimeFit";
+        $approved = $decision === 'approve';
+        $reasonLine = $approved ? '' : "Reason: ".(trim($reason) ?: 'The payment or submitted information could not be verified.')."\n\n";
+        $subject = $approved ? 'PrimeFit payment approved' : 'PrimeFit payment not approved';
+        $statusMessage = $approved
+            ? 'Your payment was approved by the admin. Your membership has been updated.'
+            : 'Your payment was reviewed by the admin but was not approved.';
+        $nextStep = $approved
+            ? 'You can sign in to your member account to view your membership.'
+            : 'Please review the reason and contact the gym if you need help.';
+        $body = "Hello {$name},\n\n{$statusMessage}\n"
+            . $planLine . $reasonLine . "{$nextStep}\n\nPrimeFit";
 
         // Resend's HTTPS API works on Render free services, which block direct
         // outbound SMTP traffic. Prefer it whenever an API key is configured.
@@ -41,11 +50,11 @@ class PendingRegistrationController extends Controller
                     ->post('https://api.resend.com/emails', [
                         'from' => $resendFrom,
                         'to' => [$email],
-                        'subject' => 'PrimeFit payment request update',
+                        'subject' => $subject,
                         'text' => $body,
                     ]);
                 if ($response->successful()) return true;
-                Log::error('Resend rejected the payment rejection email.', [
+                Log::error('Resend rejected the payment decision email.', [
                     'recipient' => $email,
                     'status' => $response->status(),
                     'response' => $response->json(),
@@ -61,7 +70,7 @@ class PendingRegistrationController extends Controller
         }
 
         if (in_array(config('mail.default'), ['log', 'array'], true)) {
-            Log::warning('Payment rejection email was not delivered because the mailer is not configured for delivery.', [
+            Log::warning('Payment decision email was not delivered because the mailer is not configured for delivery.', [
                 'recipient' => $email,
                 'mailer' => config('mail.default'),
             ]);
@@ -69,12 +78,12 @@ class PendingRegistrationController extends Controller
         }
 
         try {
-            Mail::raw($body, function ($message) use ($email) {
-                $message->to($email)->subject('PrimeFit payment request update');
+            Mail::raw($body, function ($message) use ($email, $subject) {
+                $message->to($email)->subject($subject);
             });
             return true;
         } catch (\Throwable $e) {
-            Log::error('Could not send payment rejection email.', [
+            Log::error('Could not send payment decision email.', [
                 'recipient' => $email,
                 'error' => $e->getMessage(),
             ]);
@@ -223,7 +232,25 @@ class PendingRegistrationController extends Controller
             ]);
             return $memberId;
         });
-        return response()->json(['success' => true, 'member_id' => $memberId, 'message' => 'Registration approved.']);
+        $member = $db->table('Members')->where('MemberID', $memberId)->first(['FirstName', 'Email']);
+        $registration = $db->table('PendingRegistrations')->where('RegistrationID', $id)->first(['PlanID']);
+        $plan = $registration
+            ? $db->table('Plans')->where('PlanID', $registration->PlanID)->value('DurationLabel')
+            : null;
+        $emailSent = $member ? $this->sendPaymentDecisionNotice(
+            (string) $member->Email,
+            (string) $member->FirstName,
+            $plan ? (string) $plan : null,
+            'approve',
+        ) : false;
+        return response()->json([
+            'success' => true,
+            'member_id' => $memberId,
+            'email_sent' => $emailSent,
+            'message' => $emailSent
+                ? 'Registration approved and confirmation email sent.'
+                : 'Registration approved, but the confirmation email was not delivered. Check the mail settings.',
+        ]);
     }
 
     public function reject(Request $request, int $id)
@@ -238,10 +265,11 @@ class PendingRegistrationController extends Controller
             ->update(['Status' => 'Rejected', 'ReviewedAt' => now(), 'PasswordHash' => '']);
         if (!$updated) return response()->json(['success' => false, 'message' => 'Registration not found or already reviewed.'], 409);
         $plan = $db->table('Plans')->where('PlanID', $registration->PlanID)->value('DurationLabel');
-        $emailSent = $this->sendRejectionNotice(
+        $emailSent = $this->sendPaymentDecisionNotice(
             (string) $registration->Email,
             (string) $registration->FirstName,
             $plan ? (string) $plan : null,
+            'reject',
             (string) $request->input('reason', ''),
         );
         return response()->json([
@@ -346,30 +374,27 @@ class PendingRegistrationController extends Controller
             }
             $db->table('Payments')->where('PaymentID', $id)->update(['Status' => $decision === 'approve' ? 'Paid' : 'Failed']);
         });
-        $emailSent = null;
-        if ($decision === 'reject') {
-            $details = $db->table('Payments as py')
-                ->join('Members as m', 'm.MemberID', '=', 'py.MemberID')
-                ->where('py.PaymentID', $id)
-                ->first(['m.Email', 'm.FirstName', 'py.Amount']);
-            $plan = $details
-                ? $db->table('Plans')->where('Price', $details->Amount)->value('DurationLabel')
-                : null;
-            $emailSent = $details ? $this->sendRejectionNotice(
-                (string) $details->Email,
-                (string) $details->FirstName,
-                $plan ? (string) $plan : null,
-                (string) $request->input('reason', ''),
-            ) : false;
-        }
+        $details = $db->table('Payments as py')
+            ->join('Members as m', 'm.MemberID', '=', 'py.MemberID')
+            ->where('py.PaymentID', $id)
+            ->first(['m.Email', 'm.FirstName', 'py.Amount']);
+        $plan = $details
+            ? $db->table('Plans')->where('Price', $details->Amount)->value('DurationLabel')
+            : null;
+        $emailSent = $details ? $this->sendPaymentDecisionNotice(
+            (string) $details->Email,
+            (string) $details->FirstName,
+            $plan ? (string) $plan : null,
+            $decision,
+            (string) $request->input('reason', ''),
+        ) : false;
         return response()->json([
             'success' => true,
             'email_sent' => $emailSent,
-            'message' => $decision === 'reject'
-                ? ($emailSent
-                    ? 'Payment rejected and email sent.'
-                    : 'Payment rejected, but the notification email was not delivered. Check the mail settings.')
-                : 'Payment reviewed.',
+            'message' => $emailSent
+                ? ($decision === 'approve' ? 'Payment approved and confirmation email sent.' : 'Payment rejected and email sent.')
+                : (($decision === 'approve' ? 'Payment approved' : 'Payment rejected')
+                    . ', but the notification email was not delivered. Check the mail settings.'),
         ]);
     }
 }
