@@ -20,14 +20,8 @@ class PendingRegistrationController extends Controller
     private function sendRejectionNotice(string $email, string $name, ?string $plan, string $reason): bool
     {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return false;
-        if (in_array(config('mail.default'), ['log', 'array'], true)) {
-            Log::warning('Payment rejection email was not delivered because the mailer is not configured for delivery.', [
-                'recipient' => $email,
-                'mailer' => config('mail.default'),
-            ]);
-            return false;
-        }
-
+        $resendKey = config('services.resend.key');
+        $resendFrom = config('services.resend.from_address');
         $reason = trim($reason) ?: 'We could not verify the payment receipt or submitted information.';
         $planLine = $plan ? "Plan: {$plan}\n" : '';
         $body = "Hello {$name},\n\n"
@@ -37,6 +31,42 @@ class PendingRegistrationController extends Controller
             . "Please review the reason and contact the gym or submit corrected payment information. "
             . "Your membership and session credits were not changed by this rejection.\n\n"
             . "PrimeFit";
+
+        // Resend's HTTPS API works on Render free services, which block direct
+        // outbound SMTP traffic. Prefer it whenever an API key is configured.
+        if (is_string($resendKey) && $resendKey !== ''
+            && is_string($resendFrom) && $resendFrom !== '') {
+            try {
+                $response = Http::withToken($resendKey)->acceptJson()->timeout(15)
+                    ->post('https://api.resend.com/emails', [
+                        'from' => $resendFrom,
+                        'to' => [$email],
+                        'subject' => 'PrimeFit payment request update',
+                        'text' => $body,
+                    ]);
+                if ($response->successful()) return true;
+                Log::error('Resend rejected the payment rejection email.', [
+                    'recipient' => $email,
+                    'status' => $response->status(),
+                    'response' => $response->json(),
+                ]);
+                return false;
+            } catch (\Throwable $e) {
+                Log::error('Could not send payment rejection email through Resend.', [
+                    'recipient' => $email,
+                    'error' => $e->getMessage(),
+                ]);
+                return false;
+            }
+        }
+
+        if (in_array(config('mail.default'), ['log', 'array'], true)) {
+            Log::warning('Payment rejection email was not delivered because the mailer is not configured for delivery.', [
+                'recipient' => $email,
+                'mailer' => config('mail.default'),
+            ]);
+            return false;
+        }
 
         try {
             Mail::raw($body, function ($message) use ($email) {
