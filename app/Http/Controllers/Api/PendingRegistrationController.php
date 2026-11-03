@@ -41,13 +41,39 @@ class PendingRegistrationController extends Controller
             ->leftJoin('Memberships as ms', 'ms.MembershipID', '=', 'py.MembershipID')
             ->leftJoin('Plans as p', 'p.PlanID', '=', 'ms.PlanID')
             ->where('py.Status', 'Pending')->whereNotNull('py.ReceiptURL')
-            ->get(['py.PaymentID', 'py.Amount', 'py.Method', 'py.Date', 'm.FirstName',
-                'm.LastName', 'm.Email', 'p.DurationLabel', 'py.Purpose']);
+            ->get(['py.PaymentID', 'py.MemberID', 'py.MembershipID', 'py.Amount', 'py.Method',
+                'py.Date', 'm.FirstName', 'm.LastName', 'm.Email', 'ms.PlanID as MembershipPlanID',
+                'ms.Status as MembershipStatus', 'p.DurationLabel']);
         $pending = $pending->concat($legacy->map(function ($r) {
             $plan = $r->DurationLabel;
+            $selectedPlan = null;
             if (!$plan) {
-                $matches = DB::connection('memberaccount')->table('Plans')->where('Price', $r->Amount)->limit(2)->get(['DurationLabel']);
-                if ($matches->count() === 1) $plan = $matches->first()->DurationLabel;
+                $matches = DB::connection('memberaccount')->table('Plans')
+                    ->where('Price', $r->Amount)->limit(2)->get(['PlanID', 'DurationLabel']);
+                if ($matches->count() === 1) {
+                    $selectedPlan = $matches->first();
+                    $plan = $selectedPlan->DurationLabel;
+                }
+            } else {
+                $selectedPlan = DB::connection('memberaccount')->table('Plans')
+                    ->where('PlanID', $r->MembershipPlanID)->first(['PlanID', 'DurationLabel']);
+            }
+
+            if ($r->MembershipID && $r->MembershipStatus !== 'Active') {
+                $purpose = 'New Registration';
+            } else {
+                $activePlanId = DB::connection('memberaccount')->table('Memberships')
+                    ->where('MemberID', $r->MemberID)->where('Status', 'Active')
+                    ->orderByDesc('MembershipID')->value('PlanID');
+                if (!$activePlanId) {
+                    $purpose = 'New Registration';
+                } elseif ($selectedPlan && (int) $activePlanId === (int) $selectedPlan->PlanID) {
+                    $purpose = 'Renewal';
+                } elseif ($selectedPlan) {
+                    $purpose = 'Upgrade';
+                } else {
+                    $purpose = 'Payment review';
+                }
             }
             return [
                 'payment_id' => 'P-'.$r->PaymentID,
@@ -55,8 +81,7 @@ class PendingRegistrationController extends Controller
                 'member_email' => $r->Email, 'plan' => $plan,
                 'plan_price' => $r->Amount, 'method' => $r->Method,
                 'date' => $r->Date,
-                'purpose' => in_array($r->Purpose, ['New Registration', 'Renewal', 'Upgrade'], true)
-                    ? $r->Purpose : 'Payment review',
+                'purpose' => $purpose,
             ];
         }));
         return response()->json(['success' => true, 'pending' => $pending->values()]);
