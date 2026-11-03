@@ -23,11 +23,18 @@ class PendingRegistrationController extends Controller
         ?string $plan,
         string $decision,
         string $reason = '',
+        string $replyTo = '',
     ): bool
     {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return false;
         $resendKey = config('services.resend.key');
-        $resendFrom = config('services.resend.from_address');
+        $resendFrom = config('services.resend.from_address') ?: config('mail.from.address');
+        if (is_string($resendFrom) && preg_match('/<([^>]+)>/', $resendFrom, $matches)) {
+            $resendFrom = trim($matches[1]);
+        }
+        if (!is_string($resendFrom) || !filter_var($resendFrom, FILTER_VALIDATE_EMAIL)) return false;
+        $sender = 'PrimeFit Admin <'.$resendFrom.'>';
+        $replyTo = filter_var($replyTo, FILTER_VALIDATE_EMAIL) ? $replyTo : '';
         $planLine = $plan ? "Plan: {$plan}\n" : '';
         $approved = $decision === 'approve';
         $reasonLine = $approved ? '' : "Reason: ".(trim($reason) ?: 'The payment or submitted information could not be verified.')."\n\n";
@@ -43,16 +50,17 @@ class PendingRegistrationController extends Controller
 
         // Resend's HTTPS API works on Render free services, which block direct
         // outbound SMTP traffic. Prefer it whenever an API key is configured.
-        if (is_string($resendKey) && $resendKey !== ''
-            && is_string($resendFrom) && $resendFrom !== '') {
+        if (is_string($resendKey) && $resendKey !== '') {
             try {
+                $payload = [
+                    'from' => $sender,
+                    'to' => [$email],
+                    'subject' => $subject,
+                    'text' => $body,
+                ];
+                if ($replyTo !== '') $payload['reply_to'] = [$replyTo];
                 $response = Http::withToken($resendKey)->acceptJson()->timeout(15)
-                    ->post('https://api.resend.com/emails', [
-                        'from' => $resendFrom,
-                        'to' => [$email],
-                        'subject' => $subject,
-                        'text' => $body,
-                    ]);
+                    ->post('https://api.resend.com/emails', $payload);
                 if ($response->successful()) return true;
                 Log::error('Resend rejected the payment decision email.', [
                     'recipient' => $email,
@@ -78,8 +86,9 @@ class PendingRegistrationController extends Controller
         }
 
         try {
-            Mail::raw($body, function ($message) use ($email, $subject) {
-                $message->to($email)->subject($subject);
+            Mail::raw($body, function ($message) use ($email, $subject, $resendFrom, $replyTo) {
+                $message->from($resendFrom, 'PrimeFit Admin')->to($email)->subject($subject);
+                if ($replyTo !== '') $message->replyTo($replyTo);
             });
             return true;
         } catch (\Throwable $e) {
@@ -242,6 +251,8 @@ class PendingRegistrationController extends Controller
             (string) $member->FirstName,
             $plan ? (string) $plan : null,
             'approve',
+            '',
+            (string) $request->user()->email,
         ) : false;
         return response()->json([
             'success' => true,
@@ -271,6 +282,7 @@ class PendingRegistrationController extends Controller
             $plan ? (string) $plan : null,
             'reject',
             (string) $request->input('reason', ''),
+            (string) $request->user()->email,
         );
         return response()->json([
             'success' => true,
@@ -387,6 +399,7 @@ class PendingRegistrationController extends Controller
             $plan ? (string) $plan : null,
             $decision,
             (string) $request->input('reason', ''),
+            (string) $request->user()->email,
         ) : false;
         return response()->json([
             'success' => true,
