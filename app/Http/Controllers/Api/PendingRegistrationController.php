@@ -7,7 +7,6 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Mail;
 
 class PendingRegistrationController extends Controller
 {
@@ -27,13 +26,18 @@ class PendingRegistrationController extends Controller
     ): bool
     {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return false;
-        $resendKey = config('services.resend.key');
-        $resendFrom = config('services.resend.from_address') ?: config('mail.from.address');
-        if (is_string($resendFrom) && preg_match('/<([^>]+)>/', $resendFrom, $matches)) {
-            $resendFrom = trim($matches[1]);
+        $clientId = config('services.gmail.client_id');
+        $clientSecret = config('services.gmail.client_secret');
+        $refreshToken = config('services.gmail.refresh_token');
+        $sender = config('services.gmail.sender_address');
+        if (!is_string($clientId) || $clientId === ''
+            || !is_string($clientSecret) || $clientSecret === ''
+            || !is_string($refreshToken) || $refreshToken === ''
+            || !is_string($sender) || !filter_var($sender, FILTER_VALIDATE_EMAIL)) {
+            Log::warning('Payment decision email was not delivered because Gmail API credentials are not configured.');
+            return false;
         }
-        if (!is_string($resendFrom) || !filter_var($resendFrom, FILTER_VALIDATE_EMAIL)) return false;
-        $sender = 'PrimeFit Admin <'.$resendFrom.'>';
+        $senderHeader = 'PrimeFit Admin <'.$sender.'>';
         $replyTo = filter_var($replyTo, FILTER_VALIDATE_EMAIL) ? $replyTo : '';
         $planLine = $plan ? "Plan: {$plan}\n" : '';
         $approved = $decision === 'approve';
@@ -48,51 +52,48 @@ class PendingRegistrationController extends Controller
         $body = "Hello {$name},\n\n{$statusMessage}\n"
             . $planLine . $reasonLine . "{$nextStep}\n\nPrimeFit";
 
-        // Resend's HTTPS API works on Render free services, which block direct
-        // outbound SMTP traffic. Prefer it whenever an API key is configured.
-        if (is_string($resendKey) && $resendKey !== '') {
-            try {
-                $payload = [
-                    'from' => $sender,
-                    'to' => [$email],
-                    'subject' => $subject,
-                    'text' => $body,
-                ];
-                if ($replyTo !== '') $payload['reply_to'] = [$replyTo];
-                $response = Http::withToken($resendKey)->acceptJson()->timeout(15)
-                    ->post('https://api.resend.com/emails', $payload);
-                if ($response->successful()) return true;
-                Log::error('Resend rejected the payment decision email.', [
-                    'recipient' => $email,
-                    'status' => $response->status(),
-                    'response' => $response->json(),
+        try {
+            $tokenResponse = Http::asForm()->acceptJson()->timeout(15)
+                ->post('https://oauth2.googleapis.com/token', [
+                    'client_id' => $clientId,
+                    'client_secret' => $clientSecret,
+                    'refresh_token' => $refreshToken,
+                    'grant_type' => 'refresh_token',
                 ]);
-                return false;
-            } catch (\Throwable $e) {
-                Log::error('Could not send payment rejection email through Resend.', [
-                    'recipient' => $email,
-                    'error' => $e->getMessage(),
+            if (!$tokenResponse->successful() || !$tokenResponse->json('access_token')) {
+                Log::error('Gmail OAuth token refresh failed.', [
+                    'status' => $tokenResponse->status(),
+                    'response' => $tokenResponse->json(),
                 ]);
                 return false;
             }
-        }
 
-        if (in_array(config('mail.default'), ['log', 'array'], true)) {
-            Log::warning('Payment decision email was not delivered because the mailer is not configured for delivery.', [
+            $headers = [
+                'From: '.$senderHeader,
+                'To: '.$email,
+                'Subject: '.$subject,
+                'MIME-Version: 1.0',
+                'Content-Type: text/plain; charset=UTF-8',
+                'Content-Transfer-Encoding: base64',
+            ];
+            if ($replyTo !== '') $headers[] = 'Reply-To: '.$replyTo;
+            $mime = implode("\r\n", $headers)."\r\n\r\n".chunk_split(base64_encode($body), 76, "\r\n");
+            $raw = rtrim(strtr(base64_encode($mime), '+/', '-_'), '=');
+
+            $response = Http::withToken($tokenResponse->json('access_token'))
+                ->acceptJson()->timeout(15)
+                ->post('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', [
+                    'raw' => $raw,
+                ]);
+            if ($response->successful()) return true;
+            Log::error('Gmail API rejected the payment decision email.', [
                 'recipient' => $email,
-                'mailer' => config('mail.default'),
+                'status' => $response->status(),
+                'response' => $response->json(),
             ]);
             return false;
-        }
-
-        try {
-            Mail::raw($body, function ($message) use ($email, $subject, $resendFrom, $replyTo) {
-                $message->from($resendFrom, 'PrimeFit Admin')->to($email)->subject($subject);
-                if ($replyTo !== '') $message->replyTo($replyTo);
-            });
-            return true;
         } catch (\Throwable $e) {
-            Log::error('Could not send payment decision email.', [
+            Log::error('Could not send payment decision email through Gmail API.', [
                 'recipient' => $email,
                 'error' => $e->getMessage(),
             ]);

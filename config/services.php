@@ -18,9 +18,11 @@ return [
         'key' => env('POSTMARK_API_KEY'),
     ],
 
-    'resend' => [
-        'key' => env('RESEND_API_KEY'),
-        'from_address' => env('RESEND_FROM_ADDRESS'),
+    'gmail' => [
+        'client_id' => env('GMAIL_CLIENT_ID'),
+        'client_secret' => env('GMAIL_CLIENT_SECRET'),
+        'refresh_token' => env('GMAIL_REFRESH_TOKEN'),
+        'sender_address' => env('GMAIL_SENDER_ADDRESS'),
     ],
 
     'ses' => [
