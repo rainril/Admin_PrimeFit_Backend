@@ -6,6 +6,8 @@ use App\Http\Controllers\Controller;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 
 class PendingRegistrationController extends Controller
 {
@@ -13,6 +15,41 @@ class PendingRegistrationController extends Controller
     {
         abort_unless($request->user() && $request->user()->role === 'admin'
             && $request->user()->admin()->exists(), 403);
+    }
+
+    private function sendRejectionNotice(string $email, string $name, ?string $plan, string $reason): bool
+    {
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) return false;
+        if (in_array(config('mail.default'), ['log', 'array'], true)) {
+            Log::warning('Payment rejection email was not delivered because the mailer is not configured for delivery.', [
+                'recipient' => $email,
+                'mailer' => config('mail.default'),
+            ]);
+            return false;
+        }
+
+        $reason = trim($reason) ?: 'We could not verify the payment receipt or submitted information.';
+        $planLine = $plan ? "Plan: {$plan}\n" : '';
+        $body = "Hello {$name},\n\n"
+            . "Your PrimeFit membership payment request was reviewed but could not be approved.\n"
+            . $planLine
+            . "Reason: {$reason}\n\n"
+            . "Please review the reason and contact the gym or submit corrected payment information. "
+            . "Your membership and session credits were not changed by this rejection.\n\n"
+            . "PrimeFit";
+
+        try {
+            Mail::raw($body, function ($message) use ($email) {
+                $message->to($email)->subject('PrimeFit payment request update');
+            });
+            return true;
+        } catch (\Throwable $e) {
+            Log::error('Could not send payment rejection email.', [
+                'recipient' => $email,
+                'error' => $e->getMessage(),
+            ]);
+            return false;
+        }
     }
 
     public function index(Request $request)
@@ -162,11 +199,28 @@ class PendingRegistrationController extends Controller
     public function reject(Request $request, int $id)
     {
         $this->requireAdmin($request);
-        $updated = DB::connection('memberaccount')->table('PendingRegistrations')
+        $db = DB::connection('memberaccount');
+        $registration = $db->table('PendingRegistrations')->where('RegistrationID', $id)
+            ->where('Status', 'Pending')->first(['FirstName', 'Email', 'PlanID']);
+        if (!$registration) return response()->json(['success' => false, 'message' => 'Registration not found or already reviewed.'], 409);
+        $updated = $db->table('PendingRegistrations')
             ->where('RegistrationID', $id)->where('Status', 'Pending')
             ->update(['Status' => 'Rejected', 'ReviewedAt' => now(), 'PasswordHash' => '']);
         if (!$updated) return response()->json(['success' => false, 'message' => 'Registration not found or already reviewed.'], 409);
-        return response()->json(['success' => true, 'message' => 'Registration rejected.']);
+        $plan = $db->table('Plans')->where('PlanID', $registration->PlanID)->value('DurationLabel');
+        $emailSent = $this->sendRejectionNotice(
+            (string) $registration->Email,
+            (string) $registration->FirstName,
+            $plan ? (string) $plan : null,
+            (string) $request->input('reason', ''),
+        );
+        return response()->json([
+            'success' => true,
+            'email_sent' => $emailSent,
+            'message' => $emailSent
+                ? 'Registration rejected and email sent.'
+                : 'Registration rejected, but the notification email was not delivered. Check the mail settings.',
+        ]);
     }
 
     public function legacyReceipt(Request $request, int $id)
@@ -262,6 +316,30 @@ class PendingRegistrationController extends Controller
             }
             $db->table('Payments')->where('PaymentID', $id)->update(['Status' => $decision === 'approve' ? 'Paid' : 'Failed']);
         });
-        return response()->json(['success' => true, 'message' => 'Payment reviewed.']);
+        $emailSent = null;
+        if ($decision === 'reject') {
+            $details = $db->table('Payments as py')
+                ->join('Members as m', 'm.MemberID', '=', 'py.MemberID')
+                ->where('py.PaymentID', $id)
+                ->first(['m.Email', 'm.FirstName', 'py.Amount']);
+            $plan = $details
+                ? $db->table('Plans')->where('Price', $details->Amount)->value('DurationLabel')
+                : null;
+            $emailSent = $details ? $this->sendRejectionNotice(
+                (string) $details->Email,
+                (string) $details->FirstName,
+                $plan ? (string) $plan : null,
+                (string) $request->input('reason', ''),
+            ) : false;
+        }
+        return response()->json([
+            'success' => true,
+            'email_sent' => $emailSent,
+            'message' => $decision === 'reject'
+                ? ($emailSent
+                    ? 'Payment rejected and email sent.'
+                    : 'Payment rejected, but the notification email was not delivered. Check the mail settings.')
+                : 'Payment reviewed.',
+        ]);
     }
 }
